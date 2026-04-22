@@ -17,6 +17,13 @@ for path in (MODULE_DIR, SPECDEC_DIR):
 
 from base_drafter import BaseSpeculativeDrafter
 from common.config_utils import _to_bool, _to_int, _to_optional_int
+from common.generation_backends import (
+    build_vllm_sampling_params,
+    extract_vllm_timing_ms,
+    import_vllm,
+    is_greedy_temperature,
+    normalize_generation_backend,
+)
 from common.request_utils import build_single_path_response, compute_perf, normalize_request
 from common.stop_utils import apply_stop_to_sequence, is_stop_token
 from sedna.common.class_factory import ClassFactory, ClassType
@@ -113,6 +120,9 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
         self.draft_tokens_per_step = max(1, _to_int(kwargs.get("draft_tokens_per_step"), 8))
 
         self.sample_temperature = float(kwargs.get("sample_temperature", 0.0))
+        self.generation_backend = normalize_generation_backend(
+            kwargs.get("generation_backend", "custom")
+        )
 
         self.stop_mode = str(kwargs.get("stop_mode", "choice")).strip().lower().replace("-", "_")
 
@@ -127,6 +137,7 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
 
         self.tokenizer = None
         self.model = None
+        self.vllm_model = None
 
         self._draft_sessions = {}
 
@@ -154,6 +165,25 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
         if self.tokenizer.pad_token is None:
 
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if self.inference_mode == "edge-only" and self.generation_backend == "vllm":
+            LLM, _ = import_vllm()
+            max_model_len = max(
+                2048,
+                int(self.default_prompt_tokens or 1024) + int(self.default_completion_tokens or 128) + 64,
+            )
+            self.vllm_model = LLM(
+                model=self.model_name,
+                tokenizer=self.model_name,
+                trust_remote_code=self.trust_remote_code,
+                dtype="float16" if self.device == "cuda" else "float32",
+                tensor_parallel_size=1,
+                max_model_len=max_model_len,
+                gpu_memory_utilization=0.90,
+                disable_log_stats=True,
+                enforce_eager=True,
+            )
+            return
 
         model_kwargs = {
             "trust_remote_code": self.trust_remote_code,
@@ -451,6 +481,7 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
         None
         """
         self.model = None
+        self.vllm_model = None
         self.tokenizer = None
         self._draft_sessions.clear()
     def draft_step(self, request, prompt_ids, committed_ids, window):
@@ -791,6 +822,7 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
             routed_to="edge-only",
             timestamps=timestamps,
             extra_simulation={
+                "generation_backend": self.generation_backend,
                 "stop_reason": generation_timestamps.get("stop_reason", ""),
             },
         )
@@ -817,6 +849,20 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
             `(completion_ids, compute_ms, ttft_ms, generation_timestamps)`.
             `generation_timestamps` contains the first-token timestamp and stop reason.
         """
+        if self.generation_backend == "transformers":
+            return self._generate_with_transformers(
+                prompt_ids,
+                completion_limit,
+                token_callback=token_callback,
+                request=request,
+            )
+        if self.generation_backend == "vllm":
+            return self._generate_with_vllm(
+                prompt_ids,
+                completion_limit,
+                token_callback=token_callback,
+                request=request,
+            )
 
         generated = []
         start = time.perf_counter()
@@ -862,6 +908,134 @@ class SpeculativeDraftModel(BaseSpeculativeDrafter):
         return final_ids, total_ms, (ttft_ms or total_ms), {
             "first_token_ns": first_token_ns,
             "stop_reason": final_stop_reason or stop_reason,
+        }
+
+    def _generate_with_transformers(
+        self,
+        prompt_ids,
+        completion_limit,
+        token_callback=None,
+        request=None,
+    ):
+        """
+        Run edge-only generation via `transformers.generate`.
+
+        Parameters
+        ----------
+        prompt_ids : torch.Tensor
+            Tokenized prompt ids on the local device.
+        completion_limit : int
+            Maximum number of new tokens to produce.
+        token_callback : Callable | None, default=None
+            Optional callback invoked once per generated token.
+        request : dict | None, default=None
+            Request metadata used by stop post-processing.
+
+        Returns
+        -------
+        tuple[list[int], float, float, dict]
+            Generation ids plus measured total / first-token latency metadata.
+        """
+        start_abs_ns = now_ns()
+        start = time.perf_counter()
+        generate_kwargs = {
+            "input_ids": prompt_ids,
+            "max_new_tokens": max(int(completion_limit), 0),
+            "use_cache": True,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        if self.tokenizer.eos_token_id is not None:
+            generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        if is_greedy_temperature(self.sample_temperature):
+            generate_kwargs["do_sample"] = False
+        else:
+            generate_kwargs["do_sample"] = True
+            generate_kwargs["temperature"] = float(self.sample_temperature)
+
+        outputs = self.model.generate(**generate_kwargs)
+        total_ms = (time.perf_counter() - start) * 1000.0
+        generated = outputs[0, prompt_ids.shape[1] :].tolist()
+        for token_id in generated:
+            if token_callback:
+                token_callback(int(token_id))
+
+        final_ids, final_stop_reason = apply_stop_to_sequence(
+            self.tokenizer,
+            generated,
+            self.stop_mode,
+            request=request,
+        )
+        first_token_ns = None
+        if final_ids:
+            first_token_ns = start_abs_ns + int(total_ms * 1_000_000)
+        return final_ids, total_ms, total_ms, {
+            "first_token_ns": first_token_ns,
+            "stop_reason": final_stop_reason or "completion_limit",
+        }
+
+    def _generate_with_vllm(
+        self,
+        prompt_ids,
+        completion_limit,
+        token_callback=None,
+        request=None,
+    ):
+        """
+        Run edge-only generation via the vLLM backend.
+
+        Parameters
+        ----------
+        prompt_ids : torch.Tensor
+            Tokenized prompt ids on the local device.
+        completion_limit : int
+            Maximum number of new tokens to produce.
+        token_callback : Callable | None, default=None
+            Optional callback invoked once per generated token.
+        request : dict | None, default=None
+            Request metadata used by stop post-processing.
+
+        Returns
+        -------
+        tuple[list[int], float, float, dict]
+            Generation ids plus measured total / first-token latency metadata.
+        """
+        if self.vllm_model is None:
+            raise RuntimeError("vLLM backend requested before the drafter vLLM engine was loaded.")
+
+        start_abs_ns = now_ns()
+        start = time.perf_counter()
+        sampling_params = build_vllm_sampling_params(
+            completion_limit,
+            self.sample_temperature,
+            stop_token_ids=[self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else None,
+        )
+        outputs = self.vllm_model.generate(
+            prompts=[prompt_ids[0].tolist()],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        fallback_total_ms = (time.perf_counter() - start) * 1000.0
+        request_output = outputs[0]
+        output_item = request_output.outputs[0] if request_output.outputs else None
+        generated = list(output_item.token_ids or []) if output_item is not None else []
+        for token_id in generated:
+            if token_callback:
+                token_callback(int(token_id))
+
+        total_ms, ttft_ms = extract_vllm_timing_ms(request_output, fallback_total_ms)
+        final_ids, final_stop_reason = apply_stop_to_sequence(
+            self.tokenizer,
+            generated,
+            self.stop_mode,
+            request=request,
+        )
+        first_token_ns = None
+        if final_ids:
+            first_token_ns = start_abs_ns + int(ttft_ms * 1_000_000)
+        finish_reason = str(getattr(output_item, "finish_reason", "") or "")
+        return final_ids, total_ms, ttft_ms, {
+            "first_token_ns": first_token_ns,
+            "stop_reason": final_stop_reason or finish_reason or "completion_limit",
         }
 
     def _emit_tokens(self, token_ids, token_callback, timeline):

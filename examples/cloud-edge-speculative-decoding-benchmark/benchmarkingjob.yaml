@@ -28,7 +28,9 @@ benchmarkingjob:
         [
           "dataset_processor-sample_size",
           "drafter-inference_mode",
+          "drafter-generation_backend",
           "drafter-model",
+          "verifier-generation_backend",
           "verifier-model",
           "drafter-draft_tokens_per_step"
         ]
