@@ -1,6 +1,7 @@
 draft_tokens_per_step: 8
 prompt_tokens: 1024
 max_new_tokens: 256
+generation_backend: "custom"
 stop_mode: "none"
 device: "auto"
 trust_remote_code: true

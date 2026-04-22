@@ -1,0 +1,8 @@
+{
+  "dataset": "humaneval",
+  "description": "humaneval single-turn benchmark dataset in Ianvs standard test_data layout.",
+  "level_1_dim": "single-modal",
+  "level_2_dim": "text",
+  "level_3_dim": "task-category",
+  "level_4_dim": "benchmark-name"
+}

@@ -19,6 +19,13 @@ for path in (MODULE_DIR, SPECDEC_DIR):
 
 from base_verifier import BaseSpeculativeVerifier
 from common.config_utils import _to_bool, _to_int, _to_optional_int
+from common.generation_backends import (
+    build_vllm_sampling_params,
+    extract_vllm_timing_ms,
+    import_vllm,
+    is_greedy_temperature,
+    normalize_generation_backend,
+)
 from common.request_utils import build_single_path_response, compute_perf, normalize_request
 from common.stop_utils import apply_stop_to_sequence, is_stop_token
 from result_builder import record_sample_output
@@ -211,6 +218,9 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         )
         self.draft_tokens_per_step = max(1, _to_int(kwargs.get("draft_tokens_per_step"), 8))
         self.sample_temperature = float(kwargs.get("sample_temperature", 0.0))
+        self.generation_backend = normalize_generation_backend(
+            kwargs.get("generation_backend", "custom")
+        )
         self.stop_mode = str(kwargs.get("stop_mode", "choice")).strip().lower().replace("-", "_")
 
         self.enable_network_sleep = _to_bool(kwargs.get("enable_network_sleep", False), False)
@@ -238,6 +248,7 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
 
         self.tokenizer = None
         self.model = None
+        self.vllm_model = None
 
         self._verify_sessions = {}
 
@@ -276,7 +287,7 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         # The verifier session is intentionally lightweight: it stores request,
         # prompt ids, and the committed token prefix that has been accepted so far.
         # Actual KV materialization lives in `_verify_sessions`.
-        self._ensure_loaded()
+        self._ensure_loaded(require_torch_model=self.generation_backend != "vllm")
         if request is None:
             request = normalize_request(
                 data,
@@ -417,7 +428,7 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         dict
             Ianvs response object for cloud-only inference.
         """
-        self._ensure_loaded()
+        self._ensure_loaded(require_torch_model=self.generation_backend != "vllm")
         # Cloud-only path is intentionally simpler than collaboration:
         # no draft/verify loop, just one normal autoregressive generation path
         # plus optional benchmark-side network delay simulation.
@@ -496,6 +507,7 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
                 "downlink_transfer_ms": round(network.get("downlink_transfer_ms", 0.0), 6),
                 "cloud_compute_ms": round(compute_ms, 6),
                 "draft_tokens_per_step": self.draft_tokens_per_step,
+                "generation_backend": self.generation_backend,
                 "task_name": request.get("task_name", "default"),
                 "stop_reason": generation_timestamps.get("stop_reason", ""),
             },
@@ -555,6 +567,7 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         """
 
         self.model = None
+        self.vllm_model = None
         self.tokenizer = None
         self._verify_sessions.clear()
     def verify_tokens(
@@ -950,6 +963,21 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         tuple[list[int], float, float, dict]
             `(completion_ids, total_ms, ttft_ms, timestamp_bundle)`.
         """
+        if self.generation_backend == "transformers":
+            return self._generate_with_transformers(
+                prompt_ids,
+                completion_limit,
+                token_callback=token_callback,
+                request=request,
+            )
+        if self.generation_backend == "vllm":
+            return self._generate_with_vllm(
+                prompt_ids,
+                completion_limit,
+                token_callback=token_callback,
+                request=request,
+            )
+
         generated = []
         start = time.perf_counter()
         ttft_ms = None
@@ -994,6 +1022,134 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         return final_ids, total_ms, (ttft_ms or total_ms), {
             "first_token_ns": first_token_ns,
             "stop_reason": final_stop_reason or stop_reason,
+        }
+
+    def _generate_with_transformers(
+        self,
+        prompt_ids,
+        completion_limit,
+        token_callback=None,
+        request=None,
+    ):
+        """
+        Run cloud-only generation via `transformers.generate`.
+
+        Parameters
+        ----------
+        prompt_ids : torch.Tensor
+            Tokenized prompt ids on the verifier device.
+        completion_limit : int
+            Maximum number of new tokens to produce.
+        token_callback : Callable | None, default=None
+            Optional callback invoked once per generated token.
+        request : dict | None, default=None
+            Request metadata used by stop post-processing.
+
+        Returns
+        -------
+        tuple[list[int], float, float, dict]
+            Generation ids plus measured total / first-token latency metadata.
+        """
+        start_abs_ns = now_ns()
+        start = time.perf_counter()
+        generate_kwargs = {
+            "input_ids": prompt_ids,
+            "max_new_tokens": max(int(completion_limit), 0),
+            "use_cache": True,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        if self.tokenizer.eos_token_id is not None:
+            generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        if is_greedy_temperature(self.sample_temperature):
+            generate_kwargs["do_sample"] = False
+        else:
+            generate_kwargs["do_sample"] = True
+            generate_kwargs["temperature"] = float(self.sample_temperature)
+
+        outputs = self.model.generate(**generate_kwargs)
+        total_ms = (time.perf_counter() - start) * 1000.0
+        generated = outputs[0, prompt_ids.shape[1] :].tolist()
+        for token_id in generated:
+            if token_callback:
+                token_callback(int(token_id))
+
+        final_ids, final_stop_reason = apply_stop_to_sequence(
+            self.tokenizer,
+            generated,
+            self.stop_mode,
+            request=request,
+        )
+        first_token_ns = None
+        if final_ids:
+            first_token_ns = start_abs_ns + int(total_ms * 1_000_000)
+        return final_ids, total_ms, total_ms, {
+            "first_token_ns": first_token_ns,
+            "stop_reason": final_stop_reason or "completion_limit",
+        }
+
+    def _generate_with_vllm(
+        self,
+        prompt_ids,
+        completion_limit,
+        token_callback=None,
+        request=None,
+    ):
+        """
+        Run cloud-only generation via the vLLM backend.
+
+        Parameters
+        ----------
+        prompt_ids : torch.Tensor
+            Tokenized prompt ids on the verifier device.
+        completion_limit : int
+            Maximum number of new tokens to produce.
+        token_callback : Callable | None, default=None
+            Optional callback invoked once per generated token.
+        request : dict | None, default=None
+            Request metadata used by stop post-processing.
+
+        Returns
+        -------
+        tuple[list[int], float, float, dict]
+            Generation ids plus measured total / first-token latency metadata.
+        """
+        if self.vllm_model is None:
+            raise RuntimeError("vLLM backend requested before the verifier vLLM engine was loaded.")
+
+        start_abs_ns = now_ns()
+        start = time.perf_counter()
+        sampling_params = build_vllm_sampling_params(
+            completion_limit,
+            self.sample_temperature,
+            stop_token_ids=[self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else None,
+        )
+        outputs = self.vllm_model.generate(
+            prompts=[prompt_ids[0].tolist()],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        fallback_total_ms = (time.perf_counter() - start) * 1000.0
+        request_output = outputs[0]
+        output_item = request_output.outputs[0] if request_output.outputs else None
+        generated = list(output_item.token_ids or []) if output_item is not None else []
+        for token_id in generated:
+            if token_callback:
+                token_callback(int(token_id))
+
+        total_ms, ttft_ms = extract_vllm_timing_ms(request_output, fallback_total_ms)
+        final_ids, final_stop_reason = apply_stop_to_sequence(
+            self.tokenizer,
+            generated,
+            self.stop_mode,
+            request=request,
+        )
+        first_token_ns = None
+        if final_ids:
+            first_token_ns = start_abs_ns + int(ttft_ms * 1_000_000)
+        finish_reason = str(getattr(output_item, "finish_reason", "") or "")
+        return final_ids, total_ms, ttft_ms, {
+            "first_token_ns": first_token_ns,
+            "stop_reason": final_stop_reason or finish_reason or "completion_limit",
         }
 
     def _get_active_verify_session(self, request, prompt_ids, committed_ids):
@@ -1197,23 +1353,52 @@ class SpeculativeVerifyModel(BaseSpeculativeVerifier):
         """
         return is_stop_token(self.tokenizer, token_id)
 
-    def _ensure_loaded(self):
+    def _ensure_loaded(self, require_torch_model=True):
         """
         Lazily construct tokenizer and model resources.
+
+        Parameters
+        ----------
+        require_torch_model : bool, default=True
+            Whether the PyTorch `transformers` model must be loaded for the
+            current execution path.
 
         Returns
         -------
         None
             Mutates `self.tokenizer` and `self.model`.
         """
-        if self.model is not None:
+        if self.tokenizer is not None and (
+            not require_torch_model or self.model is not None or self.vllm_model is not None
+        ):
             return
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=self.trust_remote_code,
-        )
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                trust_remote_code=self.trust_remote_code,
+            )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if not require_torch_model and self.generation_backend == "vllm":
+            if self.vllm_model is None:
+                LLM, _ = import_vllm()
+                max_model_len = max(
+                    2048,
+                    int(self.default_prompt_tokens or 1024) + int(self.default_completion_tokens or 128) + 64,
+                )
+                self.vllm_model = LLM(
+                    model=self.model_name,
+                    tokenizer=self.model_name,
+                    trust_remote_code=self.trust_remote_code,
+                    dtype="float16" if self.device == "cuda" else "float32",
+                    tensor_parallel_size=1,
+                    max_model_len=max_model_len,
+                    gpu_memory_utilization=0.90,
+                    disable_log_stats=True,
+                    enforce_eager=True,
+                )
+            return
 
         model_kwargs = {
             "trust_remote_code": self.trust_remote_code,
