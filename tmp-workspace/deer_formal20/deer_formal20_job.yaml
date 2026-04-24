@@ -1,0 +1,23 @@
+benchmarkingjob:
+  name: "deer-formal20"
+  workspace: "./workspace-cloud-edge-speculative-decoding-benchmark-deer-formal20"
+  hard_example_mining_mode: "speculative-decoding"
+  testenv: "./examples/cloud-edge-speculative-decoding-benchmark/testenv/testenv_real_tasks.yaml"
+  test_object:
+    type: "algorithms"
+    algorithms:
+      - name: "deer-formal20"
+        url: "./tmp-workspace/deer_formal20/deer_formal20_alg.yaml"
+  rank:
+    sort_by:
+      - { "Time to First Token": "ascend" }
+      - { "Throughput": "descend" }
+    visualization:
+      mode: "selected_only"
+      method: "print_table"
+    selected_dataitem:
+      paradigms: ["all"]
+      modules: ["all"]
+      hyperparameters: ["dataset_processor-sample_size", "dataset_processor-gto_bench_name", "drafter-inference_mode", "drafter-model", "verifier-model", "drafter-draft_tokens_per_step"]
+      metrics: ["Time to First Token", "Throughput", "Internal Token Latency", "End-to-End Latency", "Acceptance Rate"]
+    save_mode: "selected_and_all"

@@ -1,0 +1,46 @@
+benchmarkingjob:
+  name: "benchmarkingjob-smoke"
+  workspace: "./workspace-cloud-edge-speculative-decoding-benchmark-ar-threeway-smoke"
+
+  hard_example_mining_mode: "mining-free"
+
+  testenv: "./examples/cloud-edge-speculative-decoding-benchmark/testenv/testenv.yaml"
+
+  test_object:
+    type: "algorithms"
+    algorithms:
+      - name: "speculative-decoding-smoke"
+        url: "./tmp-workspace/ar_threeway_smoke/test_speculative_decoding_smoke.yaml"
+
+  rank:
+    sort_by:
+      - { "Time to First Token": "ascend" }
+      - { "Throughput": "descend" }
+
+    visualization:
+      mode: "selected_only"
+      method: "print_table"
+
+    selected_dataitem:
+      paradigms: [ "all" ]
+      modules: [ "all" ]
+      hyperparameters:
+        [
+          "dataset_processor-sample_size",
+          "drafter-inference_mode",
+          "drafter-model",
+          "verifier-model",
+          "drafter-draft_tokens_per_step",
+          "drafter-prompt_tokens",
+          "drafter-max_new_tokens"
+        ]
+      metrics:
+        [
+          "Time to First Token",
+          "Throughput",
+          "Internal Token Latency",
+          "End-to-End Latency",
+          "Acceptance Rate"
+        ]
+
+    save_mode: "selected_and_all"

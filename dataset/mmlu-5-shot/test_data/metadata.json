@@ -1,0 +1,8 @@
+{
+    "dataset": "MMLU",
+    "description": "Measuring Massive Multitask Language Understanding by Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt (ICLR 2021).",
+    "level_1_dim": "single-modal",
+    "level_2_dim": "text",
+    "level_3_dim": "Q&A",
+    "level_4_dim": "general"
+}

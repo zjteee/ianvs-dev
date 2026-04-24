@@ -1,0 +1,61 @@
+algorithm:
+  paradigm_type: "jointinference"
+  warmup_samples: 1
+
+  modules:
+    - type: "dataset_processor"
+      name: "SpeculativeDecodingDatasetProcessor"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/data_processor.py"
+      hyperparameters:
+        - sample_size:
+            values:
+              - 4
+
+    - type: "drafter"
+      name: "SpeculativeDraftModel"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/draft_model.py"
+      hyperparameters:
+        - other_hyperparameters:
+            values:
+              - "./tmp-workspace/specdec_opt123_smoke/base.yaml"
+        - inference_mode:
+            values:
+              - "collaboration"
+        - draft_tokens_per_step:
+            values:
+              - 4
+        - model:
+            values:
+              - "Qwen/Qwen2.5-0.5B-Instruct"
+
+    - type: "verifier"
+      name: "SpeculativeVerifyModel"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/verify_model.py"
+      hyperparameters:
+        - other_hyperparameters:
+            values:
+              - "./tmp-workspace/specdec_opt123_smoke/base.yaml"
+        - model:
+            values:
+              - "Qwen/Qwen2.5-7B-Instruct"
+        - load_in_4bit:
+            values:
+              - false
+        - bnb_4bit_compute_dtype:
+            values:
+              - "float16"
+        - bnb_4bit_quant_type:
+            values:
+              - "nf4"
+        - bnb_4bit_use_double_quant:
+            values:
+              - true
+        - quantized_cpu_offload:
+            values:
+              - false
+        - quantized_max_gpu_memory:
+            values:
+              - "18GiB"
+        - quantized_max_cpu_memory:
+            values:
+              - "64GiB"

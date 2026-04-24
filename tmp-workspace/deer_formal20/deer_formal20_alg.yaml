@@ -1,0 +1,34 @@
+algorithm:
+  paradigm_type: "jointinference"
+  warmup_samples: 3
+  modules:
+    - type: "dataset_processor"
+      name: "SpeculativeDecodingDatasetProcessor"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/data_processor.py"
+      hyperparameters:
+        - sample_size:
+            values: [20]
+        - gto_bench_name:
+            values: ["gsm8k"]
+        - gto_data_root:
+            values: ["./dataset/specdec-real-tasks"]
+    - type: "drafter"
+      name: "DeerDraftModel"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/algorithms/deer/drafter.py"
+      hyperparameters:
+        - other_hyperparameters:
+            values: ["tmp-workspace/deer_formal20/deer_formal20_profile.yaml"]
+        - inference_mode:
+            values: ["collaboration"]
+        - draft_tokens_per_step:
+            values: [8]
+        - model:
+            values: ["Qwen/Qwen2.5-0.5B-Instruct"]
+    - type: "verifier"
+      name: "SpeculativeVerifyModel"
+      url: "./examples/cloud-edge-speculative-decoding-benchmark/testalgorithms/speculative-decoding/algorithms/ar/verifier.py"
+      hyperparameters:
+        - other_hyperparameters:
+            values: ["tmp-workspace/deer_formal20/deer_formal20_profile.yaml"]
+        - model:
+            values: ["Qwen/Qwen2.5-7B-Instruct"]
